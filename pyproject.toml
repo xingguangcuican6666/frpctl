@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "frp-multinode-manager"
+version = "0.1.0"
+description = "Manage mirrored FRP mappings across multiple public nodes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "paramiko>=3.4,<5",
+  "PyYAML>=6.0,<7",
+  "rich>=13.7,<15",
+  "textual>=0.80,<2",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+frpctl = "frpctl.cli:main"
+frpdomain = "frpctl.domain_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/frpctl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Typer intentionally declares CLI metadata through default-value calls; UI and
+# command-boundary handlers must translate arbitrary runtime errors for users.
+ignore = ["B008", "BLE001", "SIM117", "PYI034"]

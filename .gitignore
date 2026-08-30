@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Live desired state and credentials. These hold FRP tokens and real host
+# addresses, so they must never be committed.
+inventory.yaml
+secrets.yaml
+domains.yaml
+*.lock
+frpc.toml
+frps.toml
+frp-manager/
+frp-manager.zip
+
+# Local scratch
+output.*
