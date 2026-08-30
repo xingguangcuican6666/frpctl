@@ -268,4 +268,27 @@ The client is resolved from the frpctl inventory: if exactly one client serves t
 
 ```bash
 .venv/bin/pytest
+.venv/bin/ruff check src tests scripts
+.venv/bin/ruff format --check src tests scripts
+```
+
+The TUI tests drive both apps headlessly through Textual's `Pilot`, so deletion, editing, the proxy dialog and the Nginx preview are covered without a terminal or a remote host.
+
+## Continuous integration
+
+Two workflows run on GitHub Actions.
+
+`.github/workflows/ci.yml` lints once with the pinned ruff from the `lint` extra, then runs the test suite on CPython 3.11, 3.12, 3.13 and 3.14.
+
+`.github/workflows/build.yml` runs `scripts/build_x86_64.py` on every push to `main`, on `v*` tags, on pull requests that touch the build script, and on demand. Because the runner is itself x86_64, it does what a cross-build host cannot: **execute** the artifact it just assembled.
+
+- the bundled interpreter reports `platform.machine() == "x86_64"`
+- `paramiko`, `cryptography`, `PyNaCl`, `bcrypt`, `PyYAML`, `textual` and `typer` all import, which is the only real proof that the cross-downloaded native wheels work
+- `bin/frpctl` and `bin/frpdomain` run `--help`, `doctor` and `list`
+- the `.run` unpacks, dispatches by argument, reuses its cache on a second call, dispatches by symlink name, and rejects an unknown tool name
+
+The tarball, the `.run` and a `SHA256SUMS` file are uploaded as a build artifact, and a `v*` tag additionally publishes them as a GitHub release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
 ```
