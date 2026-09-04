@@ -12,6 +12,7 @@ from .domains import (
     DomainBinding,
     DomainManager,
     DomainStore,
+    clone_node_domains,
     relocate_listener_port,
     render_nginx,
 )
@@ -90,6 +91,44 @@ def list_bindings(
                 node.email or "-",
             )
     console.print(table)
+
+
+@app.command("clone")
+def clone(
+    source_id: str = typer.Argument(..., help="Node whose bindings to copy."),
+    target_id: str = typer.Option(..., "--to", help="Node that receives the copy."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace bindings the target already has."
+    ),
+    inventory: Path = typer.Option(
+        Path("/etc/frp-manager/inventory.yaml"), "--inventory"
+    ),
+    domains: Path = typer.Option(Path("/etc/frp-manager/domains.yaml"), "--domains"),
+) -> None:
+    """Copy every hostname binding from one node onto another.
+
+    Only desired state changes. Run ``frpdomain apply --node <target>`` afterwards
+    to install Nginx and issue certificates there.
+    """
+    inventory_store, domain_store = stores(inventory, domains)
+    try:
+        inventory_store.load().node(target_id)
+        desired = domain_store.load()
+        target = clone_node_domains(desired, source_id, target_id, overwrite=overwrite)
+        domain_store.save(desired)
+    except FrpCtlError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"Copied {len(target.bindings)} binding(s) from {source_id} to "
+        f"[green]{target_id}[/green]"
+    )
+    for binding in target.bindings:
+        console.print(f"  {binding.hostname} -> {target_id}:{binding.upstream_port}")
+    console.print(
+        f"Add the DNS records with [bold]frpdomain dns --node {target_id}[/bold], "
+        f"then [bold]frpdomain apply --node {target_id}[/bold]."
+    )
 
 
 @app.command("dns")

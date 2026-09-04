@@ -2,7 +2,7 @@ import pytest
 
 from frpctl.errors import FrpCtlError
 from frpctl.models import Client, Inventory, Node, SSHConfig
-from frpctl.tui_widgets import resolve_client
+from frpctl.service import resolve_client
 
 
 def inventory(*node_ids_per_client: list[str]) -> Inventory:

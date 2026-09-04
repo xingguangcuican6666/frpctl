@@ -24,10 +24,13 @@ from .deploy import Check
 from .errors import FrpCtlError
 from .inventory import InventoryStore
 from .models import Mapping, Node, SSHConfig
-from .service import Credentials, Manager
-from .tui_widgets import ConfirmScreen, LogPaneMixin, resolve_client, row_key
+from .service import Credentials, Manager, cloned_node, resolve_client
+from .tui_widgets import ConfirmScreen, LogPaneMixin, row_key
 
-HELP = "↑↓ move  ·  d delete  ·  e edit  ·  p proxy  ·  s sync  ·  r refresh  ·  q quit"
+HELP = (
+    "↑↓ move  ·  d delete  ·  e edit  ·  c clone  ·  p proxy  ·  s sync  "
+    "·  r refresh  ·  q quit"
+)
 
 
 class CredentialsScreen(ModalScreen[tuple[Credentials, Credentials, bool] | None]):
@@ -152,6 +155,7 @@ class FrpCtlApp(LogPaneMixin, App):
         Binding("r", "reload", "Refresh"),
         Binding("d", "delete_selected", "Delete"),
         Binding("e", "edit_selected", "Edit"),
+        Binding("c", "clone_selected", "Clone"),
         Binding("p", "proxy_selected", "Proxy"),
         Binding("s", "sync_selected", "Sync"),
         Binding("q", "quit", "Quit"),
@@ -163,6 +167,7 @@ class FrpCtlApp(LogPaneMixin, App):
     #log { height: 9; border: round $secondary; padding: 0 1; }
     #node-form, #mapping-form { padding: 1 2; }
     #node-form Input, #mapping-form Input { margin-bottom: 1; }
+    #node-source { color: $accent; margin-bottom: 1; }
     .field { color: $text-muted; }
     .actions { height: auto; }
     .actions Button { margin-right: 1; }
@@ -174,6 +179,8 @@ class FrpCtlApp(LogPaneMixin, App):
             inventory_path, inventory_path.with_name("secrets.yaml")
         )
         self.busy = False
+        # Node id whose configuration the Add node tab will copy, set by "c".
+        self.clone_from: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -192,6 +199,7 @@ class FrpCtlApp(LogPaneMixin, App):
 
     def node_form(self) -> ComposeResult:
         with VerticalScroll(id="node-form"):
+            yield Label("Deploying a new node", id="node-source")
             yield Label("Node ID (blank derives one from the host)", classes="field")
             yield Input(placeholder="node-198-51-100-20", id="node-id")
             yield Label("Public host", classes="field")
@@ -215,6 +223,7 @@ class FrpCtlApp(LogPaneMixin, App):
             with Horizontal(classes="actions"):
                 yield Button("Preflight", id="preflight", variant="primary")
                 yield Button("Deploy", id="deploy", variant="success")
+                yield Button("Reset", id="node-reset")
 
     def mapping_form(self) -> ComposeResult:
         with VerticalScroll(id="mapping-form"):
@@ -409,6 +418,57 @@ class FrpCtlApp(LogPaneMixin, App):
         detail = f"set to {url}" if url else "cleared"
         self.write_log(f"Proxy for {kind} {host_id} {detail}", "ok")
         self.refresh_tables()
+
+    def action_clone_selected(self) -> None:
+        found = self.selection("nodes")
+        if found is None:
+            return
+        source_id = found[1]
+        try:
+            inventory = self.store.load()
+            source = inventory.node(source_id)
+            client = resolve_client(
+                inventory, source_id, self.query_one("#map-client-id", Input).value
+            )
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        fields = {
+            "#node-id": "",
+            "#node-host": "",
+            "#node-user": source.ssh.user,
+            "#node-port": str(source.ssh.port),
+            "#node-proxy": source.ssh.http_proxy or "",
+            "#client-id": client.id,
+        }
+        for selector, value in fields.items():
+            self.query_one(selector, Input).value = value
+        self.clone_from = source_id
+        self.query_one("#node-source", Label).update(
+            f"Cloning {source_id}: frp {source.frp_version}, bind "
+            f"{source.frps_bind_port}, vhost {source.vhost_http_port}/"
+            f"{source.vhost_https_port}, overrides {source.port_overrides or '{}'}"
+        )
+        self.query_one("#tabs", TabbedContent).active = "add-node"
+        self.query_one("#node-host", Input).focus()
+        self.write_log(
+            f"Cloning {source_id}; enter the new host and passwords, then Deploy"
+        )
+        if source.port_overrides:
+            self.write_log(
+                f"The twin inherits port overrides {source.port_overrides}; use "
+                "frpdomain clone and apply to put Nginx in front of them",
+                "warn",
+            )
+
+    @on(Button.Pressed, "#node-reset")
+    def reset_node_form(self) -> None:
+        for selector in ("#node-id", "#node-host", "#node-user", "#node-proxy"):
+            self.query_one(selector, Input).value = ""
+        self.query_one("#node-port", Input).value = "22"
+        self.clone_from = None
+        self.query_one("#node-source", Label).update("Deploying a new node")
+        self.write_log("Node form reset; nothing will be inherited")
 
     def action_edit_selected(self) -> None:
         found = self.selection("mappings")
@@ -632,6 +692,7 @@ class FrpCtlApp(LogPaneMixin, App):
             "port": value("#node-port") or "22",
             "proxy": value("#node-proxy"),
             "client_id": value("#client-id"),
+            "clone_from": self.clone_from or "",
         }
         node_credentials = Credentials(
             value("#node-password") or None, value("#node-sudo") or None
@@ -677,16 +738,19 @@ class FrpCtlApp(LogPaneMixin, App):
         label = "Preflight" if dry_run else "Deployment"
         try:
             inventory = self.store.load()
-            node = Node(
-                form["node_id"],
-                SSHConfig(
-                    form["host"],
-                    form["user"],
-                    int(form["port"]),
-                    http_proxy=form["proxy"] or None,
-                ),
-                inventory.next_tunnel_port(),
+            ssh = SSHConfig(
+                form["host"],
+                form["user"],
+                int(form["port"]),
+                http_proxy=form["proxy"] or None,
             )
+            tunnel_port = inventory.next_tunnel_port()
+            if form["clone_from"]:
+                source = inventory.node(form["clone_from"])
+                node = cloned_node(source, form["node_id"], ssh, tunnel_port)
+                label += f" of the {form['clone_from']} clone"
+            else:
+                node = Node(form["node_id"], ssh, tunnel_port)
             self.call_from_thread(self.write_log, f"{label} of {node.id} started")
             checks = Manager(self.store).add_node(
                 node,
@@ -699,6 +763,7 @@ class FrpCtlApp(LogPaneMixin, App):
             self.call_from_thread(self.write_log, f"{label} succeeded", "ok")
             if not dry_run:
                 self.call_from_thread(self.refresh_tables)
+                self.call_from_thread(self.reset_node_form)
         except Exception as exc:
             self.call_from_thread(self.write_log, f"ERROR {exc}", "error")
         finally:

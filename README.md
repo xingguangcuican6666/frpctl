@@ -81,6 +81,31 @@ frpctl tui
 
 `sync` validates both generated TOML files, replaces them atomically, restarts only the selected node instance, and attempts to restore backups if validation or restart fails.
 
+## Clone a node
+
+`frpctl node clone` deploys a new node carrying an existing node's whole configuration, so growing the fleet does not mean retyping it:
+
+```bash
+sudo frpctl node clone node-198-51-100-20 203.0.113.50 --dry-run
+sudo frpctl node clone node-198-51-100-20 203.0.113.50
+```
+
+Everything is inherited: the FRP version, the control bind port, both vhost ports, every port override, and the SSH user, port, key file, jump host and outbound proxy. Only identity and address change — the new node gets `node-<host>` (or `--node-id`), the address you name, and a freshly allocated tunnel port. Override any inherited field with `--user`, `--ssh-port`, `--key-file`, `--proxy-jump`, `--http-proxy`, or drop the source's proxy with `--no-http-proxy`.
+
+Two things are deliberately **not** copied. The node token and the Ed25519 tunnel key are generated per node id during deployment, which is what lets the twin fail independently of its source. And `legacy_tunnel` is always cleared, since a freshly deployed node uses the managed tunnel layout even when cloned from an imported one.
+
+The client is resolved from the source: if exactly one client serves it, the clone serves that same client and therefore mirrors the same mappings. Pass `--client` when the source serves several.
+
+If the source carries port overrides — which is what `frpdomain apply` leaves behind after moving FRP off port 80 — the clone inherits them and the command says so. The twin then serves that mapping on the relocated port with nothing in front of it until you clone the domains too:
+
+```bash
+sudo frpdomain clone node-198-51-100-20 --to node-203-0-113-50
+sudo frpdomain dns --node node-203-0-113-50
+sudo frpdomain apply --node node-203-0-113-50 --email admin@example.com
+```
+
+`frpdomain clone` copies every hostname binding, the certificate contact address and the fallback port onto the target node, and refuses to replace existing bindings unless you pass `--overwrite`. Hostnames are copied verbatim, which is what a second node fronting the same names needs; only desired state changes, so nothing is installed until `apply` runs on the target.
+
 ## Terminal UI
 
 `frpctl tui` opens an inventory browser. The Overview tab holds a Nodes table and a Mappings table; every action works on the row highlighted in the focused table, so nothing has to be retyped:
@@ -89,6 +114,7 @@ frpctl tui
 ↑ ↓   move the cursor            r   reload the desired state from disk
 d     delete the highlighted row s   synchronize the highlighted node
 e     edit the highlighted mapping (Enter does the same)
+c     clone the highlighted node into the Add node form
 p     set the outbound proxy of the highlighted host
 q     quit
 ```
@@ -98,6 +124,8 @@ q     quit
 `s` prompts for the SSH and sudo passwords of that node and its client, then offers `Dry run` or `Sync`. Passwords are used for the single run and never written to disk. Long-running deploys and syncs stream their check results into the log pane at the bottom.
 
 The Add node tab performs the same work as `frpctl node add`, with `Preflight` for a dry run and `Deploy` for the real thing. The Mapping tab adds a mapping or, once `e` has loaded one, saves changes to it; `locations` and any extra keys carried over from an imported `frpc.toml` are preserved across an edit.
+
+`c` on a Nodes row turns that tab into `frpctl node clone`: the SSH user, port and proxy are prefilled from the source, the client is set to the one the source serves, and a banner at the top names the source together with the FRP settings the twin will inherit. Type the new host, fill in the passwords and press `Deploy`. `Reset` clears the form and forgets the source, so the next deploy inherits nothing.
 
 ## Build x86_64 artifacts
 
@@ -243,6 +271,7 @@ Certificates are stored under `/etc/letsencrypt/live/frpdomain-<node-id>/`. The 
 ↑ ↓   move the cursor            r   reload the desired state from disk
 d     delete the highlighted binding
 e     edit the highlighted binding (Enter does the same)
+c     copy every binding of its node onto another node
 g     render the final Nginx configuration for its node
 a     apply domains and HTTPS to its node
 q     quit
@@ -255,6 +284,8 @@ Saving a binding whose hostname you changed while editing renames it rather than
 `g` previews on a deep copy of the inventory, so the port-80 relocation it shows is not written to disk; it reports the port FRP would move to. `a` opens one form with the certificate email (prefilled from the stored value), the SSH and sudo passwords for the node and the client, and the `--skip-dns-check` / `--edge-proxy` switches, then streams progress into the log pane. Nothing is applied until that form is submitted, and the passwords are used for the single run.
 
 The client is resolved from the frpctl inventory: if exactly one client serves the node it is used automatically, otherwise the Client ID field on the Binding tab breaks the tie.
+
+`c` runs `frpdomain clone` from the highlighted row: it asks which node should receive the copy, listing the managed node ids, and warns before overwriting bindings the target already has. Only desired state changes, so follow it with the DNS records and `a` on the target.
 
 ## Security notes
 

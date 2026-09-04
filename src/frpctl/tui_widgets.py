@@ -10,10 +10,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Label, RichLog
-
-from .errors import FrpCtlError
-from .models import Client, Inventory
+from textual.widgets import Button, DataTable, Input, Label, RichLog
 
 LEVEL_STYLE = {"ok": "green", "warn": "yellow", "error": "red"}
 
@@ -40,23 +37,6 @@ def row_key(table: DataTable) -> str | None:
     except Exception:
         return None
     return None if key is None else str(key)
-
-
-def resolve_client(inventory: Inventory, node_id: str, preferred: str | None) -> Client:
-    """Pick the client serving ``node_id``, using ``preferred`` to break ties."""
-    clients = [x for x in inventory.clients if node_id in x.node_ids]
-    if not clients:
-        raise FrpCtlError(f"{node_id} is not attached to any client")
-    if len(clients) == 1:
-        return clients[0]
-    match = next((x for x in clients if x.id == preferred), None)
-    if match is None:
-        names = ", ".join(x.id for x in clients)
-        raise FrpCtlError(
-            f"{node_id} serves several clients ({names}); set the client ID "
-            "field to choose one"
-        )
-    return match
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -100,3 +80,57 @@ class ConfirmScreen(ModalScreen[bool]):
     @on(Button.Pressed, "#cancel")
     def action_dismiss_false(self) -> None:
         self.dismiss(False)
+
+
+class PromptScreen(ModalScreen[str | None]):
+    """Ask for one line of text; returns the stripped value, or None on cancel."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+    CSS = """
+    PromptScreen { align: center middle; }
+    #prompt-box {
+        width: 78; height: auto; padding: 1 2;
+        border: round $accent; background: $surface;
+    }
+    #prompt-box Input { margin: 1 0; }
+    #prompt-detail { color: $text-muted; }
+    #prompt-box Button { margin-right: 1; }
+    """
+
+    def __init__(
+        self,
+        title: str,
+        detail: str,
+        placeholder: str = "",
+        value: str = "",
+        confirm_label: str = "Save",
+    ) -> None:
+        super().__init__()
+        self.heading = title
+        self.detail = detail
+        self.placeholder = placeholder
+        self.value = value
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-box"):
+            yield Label(self.heading)
+            yield Label(self.detail, id="prompt-detail")
+            yield Input(
+                value=self.value, placeholder=self.placeholder, id="prompt-value"
+            )
+            with Horizontal():
+                yield Button(self.confirm_label, id="prompt-ok", variant="success")
+                yield Button("Cancel", id="prompt-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-value", Input).focus()
+
+    @on(Input.Submitted, "#prompt-value")
+    @on(Button.Pressed, "#prompt-ok")
+    def confirm(self) -> None:
+        self.dismiss(self.query_one("#prompt-value", Input).value.strip())
+
+    @on(Button.Pressed, "#prompt-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)

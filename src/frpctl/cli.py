@@ -11,7 +11,13 @@ from .errors import FrpCtlError
 from .frp import import_frpc, redact_toml, render_frpc, render_frps
 from .inventory import InventoryStore
 from .models import Client, Inventory, Mapping, Node, SSHConfig
-from .service import Credentials, Manager
+from .service import (
+    Credentials,
+    Manager,
+    cloned_node,
+    cloned_ssh,
+    resolve_client,
+)
 
 app = typer.Typer(
     no_args_is_help=True, help="Manage mirrored FRP mappings across public nodes."
@@ -158,6 +164,104 @@ def node_add(
             "Dry-run complete."
             if dry_run
             else f"Node [green]{node_id}[/green] deployed and saved."
+        )
+    except FrpCtlError as exc:
+        fail(exc)
+
+
+@node_app.command("clone")
+def node_clone(
+    source_id: str = typer.Argument(..., help="Node whose configuration to copy."),
+    host: str = typer.Argument(..., help="Public host of the new node."),
+    node_id: str | None = typer.Option(None, help="Defaults to node-<host>."),
+    user: str | None = typer.Option(None, help="Defaults to the source SSH user."),
+    ssh_port: int | None = typer.Option(None, help="Defaults to the source SSH port."),
+    key_file: str | None = typer.Option(None),
+    proxy_jump: str | None = typer.Option(None),
+    http_proxy: str | None = typer.Option(None, "--http-proxy"),
+    no_http_proxy: bool = typer.Option(
+        False, "--no-http-proxy", help="Do not inherit the source node's proxy."
+    ),
+    client_id: str | None = typer.Option(
+        None, "--client", help="Defaults to the client the source node serves."
+    ),
+    inventory: Path = typer.Option(
+        Path("/etc/frp-manager/inventory.yaml"), "--inventory"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Deploy a new node carrying the source node's whole configuration.
+
+    Everything is inherited except identity and address: FRP version, bind and
+    vhost ports, port overrides and SSH settings. The node token and tunnel key
+    are generated fresh, so the two nodes still fail independently.
+    """
+    target = store(inventory, None)
+    inv = target.load()
+    try:
+        source = inv.node(source_id)
+        client = resolve_client(inv, source_id, client_id)
+    except FrpCtlError as exc:
+        fail(exc)
+        return
+    node_id = node_id or "node-" + host.replace(".", "-")
+    ssh = cloned_ssh(
+        source.ssh,
+        host,
+        user=user,
+        port=ssh_port,
+        key_file=key_file,
+        proxy_jump=proxy_jump,
+        http_proxy=http_proxy,
+    )
+    if no_http_proxy:
+        ssh.http_proxy = None
+    node = cloned_node(source, node_id, ssh, inv.next_tunnel_port())
+    console.print(
+        f"Cloning [cyan]{source_id}[/cyan] -> [cyan]{node_id}[/cyan] "
+        f"({ssh.user}@{ssh.host}:{ssh.port}) for client {client.id}"
+    )
+    console.print(
+        f"  frp {node.frp_version}, bind {node.frps_bind_port}, "
+        f"vhost {node.vhost_http_port}/{node.vhost_https_port}, "
+        f"tunnel {node.tunnel_port}, proxy {ssh.http_proxy or '-'}"
+    )
+    if node.port_overrides:
+        console.print(
+            f"  [yellow]inherited port overrides {node.port_overrides}; run "
+            f"frpdomain clone {source_id} --to {node_id} and frpdomain apply to "
+            "put Nginx in front of them[/yellow]"
+        )
+    password = (
+        None
+        if ssh.key_file
+        else getpass.getpass(f"SSH password for {ssh.user}@{host}: ")
+    )
+    sudo_password = getpass.getpass("sudo password (empty if not required): ") or None
+    client_password = (
+        None
+        if client.ssh.key_file
+        else getpass.getpass(f"SSH password for {client.ssh.user}@{client.ssh.host}: ")
+    )
+    client_sudo = (
+        getpass.getpass("client sudo password (empty if not required): ") or None
+    )
+    try:
+        checks = Manager(target).add_node(
+            node,
+            client.id,
+            Credentials(password, sudo_password),
+            Credentials(client_password, client_sudo),
+            dry_run=dry_run,
+        )
+        for check in checks:
+            console.print(
+                f"[{'green' if check.ok else 'red'}]{check.name}[/]: {check.detail}"
+            )
+        console.print(
+            "Dry-run complete."
+            if dry_run
+            else f"Node [green]{node_id}[/green] cloned from {source_id} and saved."
         )
     except FrpCtlError as exc:
         fail(exc)

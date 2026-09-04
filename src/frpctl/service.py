@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .deploy import Check, Deployer
-from .errors import ValidationError
+from .errors import FrpCtlError, ValidationError
 from .inventory import InventoryStore
-from .models import Node
+from .models import Client, Inventory, Node, SSHConfig
 from .ssh import SSHExecutor
 
 
@@ -13,6 +13,53 @@ from .ssh import SSHExecutor
 class Credentials:
     password: str | None = None
     sudo_password: str | None = None
+
+
+def resolve_client(inventory: Inventory, node_id: str, preferred: str | None) -> Client:
+    """Pick the client serving ``node_id``, using ``preferred`` to break ties."""
+    clients = [x for x in inventory.clients if node_id in x.node_ids]
+    if not clients:
+        raise FrpCtlError(f"{node_id} is not attached to any client")
+    if len(clients) == 1:
+        return clients[0]
+    match = next((x for x in clients if x.id == preferred), None)
+    if match is None:
+        names = ", ".join(x.id for x in clients)
+        raise FrpCtlError(
+            f"{node_id} serves several clients ({names}); name one explicitly"
+        )
+    return match
+
+
+def cloned_ssh(source: SSHConfig, host: str, **overrides: object) -> SSHConfig:
+    """Copy a host's SSH settings onto a new address.
+
+    Every field is inherited; an override of ``None`` means "keep the source
+    value", so callers pass only what actually differs. Clearing an inherited
+    field is done on the result, which keeps the sentinel handling in one place.
+    """
+    given = {key: value for key, value in overrides.items() if value is not None}
+    return replace(source, host=host, **given)
+
+
+def cloned_node(source: Node, node_id: str, ssh: SSHConfig, tunnel_port: int) -> Node:
+    """Build a twin of ``source`` that differs only in identity and address.
+
+    The FRP-level settings are copied verbatim, including ``port_overrides``, so
+    the twin publishes each mapping on the same effective port as the original.
+    Secrets are never copied: the node token and the tunnel key are generated
+    per node id during deployment, which is what keeps nodes able to fail
+    independently.  ``legacy_tunnel`` is always cleared because a freshly
+    deployed node uses the managed tunnel layout.
+    """
+    return replace(
+        source,
+        id=node_id,
+        ssh=ssh,
+        tunnel_port=tunnel_port,
+        port_overrides=dict(source.port_overrides),
+        legacy_tunnel=False,
+    )
 
 
 class Manager:

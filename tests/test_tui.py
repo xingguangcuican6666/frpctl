@@ -214,6 +214,55 @@ def test_an_invalid_proxy_is_rejected_and_not_saved(tmp_path):
     assert store.load().node("node-a").ssh.http_proxy is None
 
 
+def test_clone_key_prefills_the_add_node_form_from_the_source(tmp_path):
+    def prepare(store):
+        inventory = store.load()
+        inventory.node("node-a").ssh.port = 2222
+        inventory.node("node-a").ssh.http_proxy = "http://10.0.0.8:3128"
+        store.save(inventory)
+
+    async def scenario(app, pilot):
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.query_one("#tabs", TabbedContent).active == "add-node"
+        assert app.clone_from == "node-a"
+        # Identity and address must be typed; everything else is inherited.
+        assert app.query_one("#node-id", Input).value == ""
+        assert app.query_one("#node-host", Input).value == ""
+        assert app.query_one("#node-user", Input).value == "root"
+        assert app.query_one("#node-port", Input).value == "2222"
+        assert app.query_one("#node-proxy", Input).value == "http://10.0.0.8:3128"
+        assert app.query_one("#client-id", Input).value == "client-109"
+
+    drive(tmp_path, scenario, prepare)
+
+
+def test_reset_button_forgets_the_clone_source(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.clone_from == "node-a"
+        app.reset_node_form()
+        await pilot.pause()
+        assert app.clone_from is None
+        assert app.query_one("#node-user", Input).value == ""
+        assert app.query_one("#node-port", Input).value == "22"
+
+    drive(tmp_path, scenario)
+
+
+def test_clone_needs_a_node_row(tmp_path):
+    async def scenario(app, pilot):
+        app.query_one("#mappings", DataTable).focus()
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.clone_from is None
+        assert app.query_one("#tabs", TabbedContent).active == "overview"
+
+    drive(tmp_path, scenario)
+
+
 def test_sync_needs_a_node_row(tmp_path):
     async def scenario(app, pilot):
         app.query_one("#mappings", DataTable).focus()

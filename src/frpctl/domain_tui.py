@@ -29,15 +29,19 @@ from .domains import (
     DomainBinding,
     DomainManager,
     DomainStore,
+    clone_node_domains,
     relocate_listener_port,
     render_nginx,
 )
 from .errors import FrpCtlError
 from .inventory import InventoryStore
-from .service import Credentials
-from .tui_widgets import ConfirmScreen, LogPaneMixin, resolve_client, row_key
+from .service import Credentials, resolve_client
+from .tui_widgets import ConfirmScreen, LogPaneMixin, PromptScreen, row_key
 
-HELP = "↑↓ move  ·  d delete  ·  e edit  ·  g plan  ·  a apply  ·  r refresh  ·  q quit"
+HELP = (
+    "↑↓ move  ·  d delete  ·  e edit  ·  c clone  ·  g plan  ·  a apply  "
+    "·  r refresh  ·  q quit"
+)
 
 
 @dataclass(slots=True)
@@ -144,6 +148,7 @@ class FrpDomainApp(LogPaneMixin, App):
         Binding("r", "reload", "Refresh"),
         Binding("d", "delete_selected", "Delete"),
         Binding("e", "edit_selected", "Edit"),
+        Binding("c", "clone_selected", "Clone"),
         Binding("g", "plan_selected", "Plan"),
         Binding("a", "apply_selected", "Apply"),
         Binding("q", "quit", "Quit"),
@@ -388,6 +393,80 @@ class FrpDomainApp(LogPaneMixin, App):
             return
         previous.bindings = [x for x in previous.bindings if x.hostname != old_hostname]
         self.write_log(f"Renamed {old_node_id}/{old_hostname} -> {node_id}/{hostname}")
+
+    def action_clone_selected(self) -> None:
+        found = self.selected_binding()
+        if found is None:
+            return
+        source_id = found[0]
+        try:
+            count = len(self.domains.load().node(source_id).bindings)
+            managed = [x.id for x in self.store.load().nodes if x.id != source_id]
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        detail = (
+            f"Copies all {count} binding(s), the certificate email and the "
+            "fallback port onto another node. Nothing is installed; run apply on "
+            "the target afterwards."
+        )
+        if managed:
+            detail += " Managed nodes: " + ", ".join(managed)
+        self.push_screen(
+            PromptScreen(
+                f"Clone the bindings of {source_id} to which node?",
+                detail,
+                placeholder="node-203-0-113-123",
+                confirm_label="Clone",
+            ),
+            lambda target: self.clone_to(source_id, target),
+        )
+
+    def clone_to(self, source_id: str, target_id: str | None) -> None:
+        if not target_id:
+            self.write_log("Clone cancelled")
+            return
+        try:
+            self.store.load().node(target_id)
+            existing = len(self.domains.load().node(target_id).bindings)
+        except FrpCtlError:
+            # No domain configuration yet, or an unmanaged node id; the copy
+            # itself reports the second case.
+            existing = 0
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        if existing:
+            self.push_screen(
+                ConfirmScreen(
+                    f"Replace {existing} binding(s) on {target_id}?",
+                    f"They are overwritten with the bindings of {source_id}.",
+                    "Overwrite",
+                ),
+                lambda ok: (
+                    self.copy_bindings(source_id, target_id, True) if ok else None
+                ),
+            )
+            return
+        self.copy_bindings(source_id, target_id, False)
+
+    def copy_bindings(self, source_id: str, target_id: str, overwrite: bool) -> None:
+        try:
+            self.store.load().node(target_id)
+            desired = self.domains.load()
+            target = clone_node_domains(
+                desired, source_id, target_id, overwrite=overwrite
+            )
+            self.domains.save(desired)
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        self.write_log(
+            f"Copied {len(target.bindings)} binding(s) from {source_id} to "
+            f"{target_id}; add the DNS records, then apply on {target_id}",
+            "ok",
+        )
+        self.refresh_tables()
 
     def action_plan_selected(self) -> None:
         found = self.selected_binding()

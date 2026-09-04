@@ -126,6 +126,40 @@ class DomainStore:
         InventoryStore._atomic_yaml(self.path, asdict(inventory))
 
 
+def clone_node_domains(
+    inventory: DomainInventory,
+    source_id: str,
+    target_id: str,
+    *,
+    overwrite: bool = False,
+) -> NodeDomains:
+    """Copy every domain binding from one node onto another.
+
+    Hostnames are copied verbatim, which is what a second node fronting the same
+    names needs; the DNS records and the certificates for the target are created
+    later by ``frpdomain apply``. The certificate contact address and the
+    fallback port travel with the bindings, since both describe the same site.
+    """
+    if source_id == target_id:
+        raise ValidationError("source and target node must differ")
+    source = inventory.node(source_id)
+    if not source.bindings:
+        raise ValidationError(f"{source_id} has no domain bindings to copy")
+    target = inventory.node(target_id, create=True)
+    if target.bindings and not overwrite:
+        raise ValidationError(
+            f"{target_id} already has {len(target.bindings)} binding(s); pass "
+            "--overwrite to replace them"
+        )
+    target.email = source.email
+    target.fallback_port = source.fallback_port
+    target.bindings = [
+        DomainBinding(x.hostname, x.upstream_port) for x in source.bindings
+    ]
+    inventory.validate()
+    return target
+
+
 def choose_relocation_port(
     inventory: Inventory, node: Node, client: Client, start: int = 10080
 ) -> int:

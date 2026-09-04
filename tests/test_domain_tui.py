@@ -6,7 +6,7 @@ from frpctl.domain_tui import ApplyScreen, FrpDomainApp
 from frpctl.domains import DomainBinding, DomainInventory, DomainStore, NodeDomains
 from frpctl.inventory import InventoryStore
 from frpctl.models import Client, Inventory, Mapping, Node, SSHConfig
-from frpctl.tui_widgets import ConfirmScreen
+from frpctl.tui_widgets import ConfirmScreen, PromptScreen
 
 
 def seed(tmp_path):
@@ -21,10 +21,13 @@ def seed(tmp_path):
                         Mapping("web", "tcp", "127.0.0.1", 80, 80),
                         Mapping("api", "tcp", "127.0.0.1", 3000, 13000),
                     ],
-                    ["node-139"],
+                    ["node-139", "node-203"],
                 )
             ],
-            nodes=[Node("node-139", SSHConfig("198.51.100.20", "root"), 17001)],
+            nodes=[
+                Node("node-139", SSHConfig("198.51.100.20", "root"), 17001),
+                Node("node-203", SSHConfig("203.0.113.123", "root"), 17002),
+            ],
         ),
         {"nodes": {"node-139": {"token": "secret"}}},
     )
@@ -188,6 +191,74 @@ def test_a_missing_upstream_port_is_rejected(tmp_path):
 
     _, domains = drive(tmp_path, scenario)
     assert len(bindings(domains)) == 2
+
+
+def test_clone_key_copies_every_binding_to_another_node(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("c")
+        await pilot.pause()
+        assert isinstance(app.screen, PromptScreen)
+        app.screen.query_one("#prompt-value", Input).value = "node-203"
+        await pilot.press("enter")
+        await pilot.pause()
+        # Both nodes are now listed, so the table doubled.
+        assert app.query_one("#table", DataTable).row_count == 4
+
+    _, domains = drive(tmp_path, scenario)
+    assert bindings(domains, "node-203") == {
+        "example.com": 80,
+        "api.example.com": 13000,
+    }
+    assert domains.load().node("node-203").email == "admin@example.com"
+    # The source is untouched.
+    assert bindings(domains, "node-139") == {
+        "example.com": 80,
+        "api.example.com": 13000,
+    }
+
+
+def test_clone_can_be_cancelled(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("c")
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query_one("#table", DataTable).row_count == 2
+
+    _, domains = drive(tmp_path, scenario)
+    assert [x.node_id for x in domains.load().nodes] == ["node-139"]
+
+
+def test_clone_onto_an_unmanaged_node_is_rejected(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("c")
+        await pilot.pause()
+        app.screen.query_one("#prompt-value", Input).value = "node-404"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.query_one("#table", DataTable).row_count == 2
+
+    _, domains = drive(tmp_path, scenario)
+    assert [x.node_id for x in domains.load().nodes] == ["node-139"]
+
+
+def test_cloning_over_existing_bindings_asks_first(tmp_path):
+    async def scenario(app, pilot):
+        # Seed the target by cloning once, then clone again over it.
+        app.copy_bindings("node-139", "node-203", False)
+        await pilot.pause()
+        app.query_one("#table", DataTable).move_cursor(row=0)
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        app.screen.query_one("#prompt-value", Input).value = "node-203"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+
+    _, domains = drive(tmp_path, scenario)
+    assert len(bindings(domains, "node-203")) == 2
 
 
 def test_plan_key_renders_nginx_without_touching_the_inventory(tmp_path):
