@@ -121,6 +121,12 @@ def node_add(
         help="Proxy the node itself uses for outbound HTTP(S), e.g. "
         "http://127.0.0.1:7890. Resolved on the node, not on this machine.",
     ),
+    ssh_proxy: str | None = typer.Option(
+        None,
+        "--ssh-proxy",
+        help="SOCKS proxy this machine routes the node's SSH through, e.g. "
+        "socks5h://127.0.0.1:1080. Resolved here, not on the node.",
+    ),
     client_id: str = typer.Option("client-109"),
     inventory: Path = typer.Option(
         Path("/etc/frp-manager/inventory.yaml"), "--inventory"
@@ -145,7 +151,15 @@ def node_add(
     )
     node = Node(
         node_id,
-        SSHConfig(host, user, ssh_port, key_file, proxy_jump, http_proxy=http_proxy),
+        SSHConfig(
+            host,
+            user,
+            ssh_port,
+            key_file,
+            proxy_jump,
+            http_proxy=http_proxy,
+            ssh_proxy=ssh_proxy,
+        ),
         inv.next_tunnel_port(),
     )
     try:
@@ -182,6 +196,10 @@ def node_clone(
     no_http_proxy: bool = typer.Option(
         False, "--no-http-proxy", help="Do not inherit the source node's proxy."
     ),
+    ssh_proxy: str | None = typer.Option(None, "--ssh-proxy"),
+    no_ssh_proxy: bool = typer.Option(
+        False, "--no-ssh-proxy", help="Do not inherit the source node's SSH proxy."
+    ),
     client_id: str | None = typer.Option(
         None, "--client", help="Defaults to the client the source node serves."
     ),
@@ -213,9 +231,12 @@ def node_clone(
         key_file=key_file,
         proxy_jump=proxy_jump,
         http_proxy=http_proxy,
+        ssh_proxy=ssh_proxy,
     )
     if no_http_proxy:
         ssh.http_proxy = None
+    if no_ssh_proxy:
+        ssh.ssh_proxy = None
     node = cloned_node(source, node_id, ssh, inv.next_tunnel_port())
     console.print(
         f"Cloning [cyan]{source_id}[/cyan] -> [cyan]{node_id}[/cyan] "
@@ -224,7 +245,8 @@ def node_clone(
     console.print(
         f"  frp {node.frp_version}, bind {node.frps_bind_port}, "
         f"vhost {node.vhost_http_port}/{node.vhost_https_port}, "
-        f"tunnel {node.tunnel_port}, proxy {ssh.http_proxy or '-'}"
+        f"tunnel {node.tunnel_port}, proxy {ssh.http_proxy or '-'}, "
+        f"ssh via {ssh.ssh_proxy or '-'}"
     )
     if node.port_overrides:
         console.print(
@@ -267,6 +289,73 @@ def node_clone(
         fail(exc)
 
 
+@node_app.command("edit")
+def node_edit(
+    node_id: str,
+    host: str | None = typer.Option(None, help="New public host or address."),
+    user: str | None = typer.Option(None, help="New SSH user."),
+    ssh_port: int | None = typer.Option(None, "--ssh-port", help="New SSH port."),
+    key_file: str | None = typer.Option(
+        None, "--key-file", help="SSH key path; pass an empty string to clear it."
+    ),
+    proxy_jump: str | None = typer.Option(
+        None, "--proxy-jump", help="SSH jump host; pass an empty string to clear it."
+    ),
+    http_proxy: str | None = typer.Option(
+        None,
+        "--http-proxy",
+        help="Proxy the node uses for its own outbound HTTP(S); pass an empty "
+        "string to clear it.",
+    ),
+    ssh_proxy: str | None = typer.Option(
+        None,
+        "--ssh-proxy",
+        help="SOCKS proxy this machine routes the node's SSH through; pass an "
+        "empty string to clear it.",
+    ),
+    frp_version: str | None = typer.Option(
+        None, "--frp-version", help="FRP release installed on the next sync."
+    ),
+    inventory: Path = typer.Option(
+        Path("/etc/frp-manager/inventory.yaml"), "--inventory"
+    ),
+) -> None:
+    """Edit a node's connection info; run sync to apply it.
+
+    Only the options you pass change. For a proxy, jump host or key file pass an
+    empty string to clear it, e.g. --ssh-proxy '' drops the SSH proxy. Identity,
+    tunnel port and FRP ports are managed by add, clone and frpdomain instead.
+    """
+    target = store(inventory, None)
+    try:
+        with target.lock():
+            inv = target.load()
+            node = inv.node(node_id)
+            ssh = node.ssh
+            if host is not None:
+                ssh.host = host
+            if user is not None:
+                ssh.user = user
+            if ssh_port is not None:
+                ssh.port = ssh_port
+            if key_file is not None:
+                ssh.key_file = key_file or None
+            if proxy_jump is not None:
+                ssh.proxy_jump = proxy_jump or None
+            if http_proxy is not None:
+                ssh.http_proxy = http_proxy or None
+            if ssh_proxy is not None:
+                ssh.ssh_proxy = ssh_proxy or None
+            if frp_version is not None:
+                node.frp_version = frp_version
+            inv.validate()
+            target.save(inv)
+    except FrpCtlError as exc:
+        fail(exc)
+        return
+    console.print(f"Updated node {node_id}; run sync to apply it.")
+
+
 @node_app.command("remove")
 def node_remove(
     node_id: str,
@@ -294,7 +383,7 @@ def node_list(
     ),
 ) -> None:
     inv = store(inventory, None).load()
-    table = Table("ID", "Host", "User", "Tunnel", "Version", "Mode", "Proxy")
+    table = Table("ID", "Host", "User", "Tunnel", "Version", "Mode", "Proxy", "SSH via")
     for node in inv.nodes:
         table.add_row(
             node.id,
@@ -304,6 +393,7 @@ def node_list(
             node.frp_version,
             "legacy" if node.legacy_tunnel else "managed",
             node.ssh.http_proxy or "-",
+            node.ssh.ssh_proxy or "-",
         )
     console.print(table)
 

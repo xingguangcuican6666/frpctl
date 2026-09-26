@@ -90,7 +90,7 @@ sudo frpctl node clone node-198-51-100-20 203.0.113.50 --dry-run
 sudo frpctl node clone node-198-51-100-20 203.0.113.50
 ```
 
-Everything is inherited: the FRP version, the control bind port, both vhost ports, every port override, and the SSH user, port, key file, jump host and outbound proxy. Only identity and address change — the new node gets `node-<host>` (or `--node-id`), the address you name, and a freshly allocated tunnel port. Override any inherited field with `--user`, `--ssh-port`, `--key-file`, `--proxy-jump`, `--http-proxy`, or drop the source's proxy with `--no-http-proxy`.
+Everything is inherited: the FRP version, the control bind port, both vhost ports, every port override, and the SSH user, port, key file, jump host, outbound proxy and SSH SOCKS proxy. Only identity and address change — the new node gets `node-<host>` (or `--node-id`), the address you name, and a freshly allocated tunnel port. Override any inherited field with `--user`, `--ssh-port`, `--key-file`, `--proxy-jump`, `--http-proxy` or `--ssh-proxy`, or drop the source's proxies with `--no-http-proxy` and `--no-ssh-proxy`.
 
 Two things are deliberately **not** copied. The node token and the Ed25519 tunnel key are generated per node id during deployment, which is what lets the twin fail independently of its source. And `legacy_tunnel` is always cleared, since a freshly deployed node uses the managed tunnel layout even when cloned from an imported one.
 
@@ -106,6 +106,18 @@ sudo frpdomain apply --node node-203-0-113-50 --email admin@example.com
 
 `frpdomain clone` copies every hostname binding, the certificate contact address and the fallback port onto the target node, and refuses to replace existing bindings unless you pass `--overwrite`. Hostnames are copied verbatim, which is what a second node fronting the same names needs; only desired state changes, so nothing is installed until `apply` runs on the target.
 
+## Edit a node
+
+`frpctl node edit` changes a node's connection info in place — useful when an address moves, a key rotates, or you add a proxy to a node deployed without one:
+
+```bash
+frpctl node edit node-198-51-100-20 --host 203.0.113.60 --ssh-port 2222
+frpctl node edit node-198-51-100-20 --ssh-proxy socks5h://127.0.0.1:1080
+frpctl node edit node-198-51-100-20 --ssh-proxy ''   # clear it
+```
+
+Only the options you pass change; the rest are left as they are. Editable fields are the SSH `--host`, `--user`, `--ssh-port`, `--key-file`, `--proxy-jump`, `--http-proxy` and `--ssh-proxy`, plus `--frp-version`. For the four nullable fields — the key file, jump host and both proxies — an empty string clears the value. Identity, the tunnel port and the FRP bind/vhost ports are owned by `node add`, `node clone` and `frpdomain`, so `node edit` leaves them alone. The change is written to desired state and re-validated on save; run `frpctl sync` to push it to the node. The TUI does the same from `e` on a Nodes row.
+
 ## Terminal UI
 
 `frpctl tui` opens an inventory browser. The Overview tab holds a Nodes table and a Mappings table; every action works on the row highlighted in the focused table, so nothing has to be retyped:
@@ -113,7 +125,7 @@ sudo frpdomain apply --node node-203-0-113-50 --email admin@example.com
 ```text
 ↑ ↓   move the cursor            r   reload the desired state from disk
 d     delete the highlighted row s   synchronize the highlighted node
-e     edit the highlighted mapping (Enter does the same)
+e     edit the highlighted row (a node's connection info, or a mapping)
 c     clone the highlighted node into the Add node form
 p     set the outbound proxy of the highlighted host
 q     quit
@@ -123,9 +135,9 @@ q     quit
 
 `s` prompts for the SSH and sudo passwords of that node and its client, then offers `Dry run` or `Sync`. Passwords are used for the single run and never written to disk. Long-running deploys and syncs stream their check results into the log pane at the bottom.
 
-The Add node tab performs the same work as `frpctl node add`, with `Preflight` for a dry run and `Deploy` for the real thing. The Mapping tab adds a mapping or, once `e` has loaded one, saves changes to it; `locations` and any extra keys carried over from an imported `frpc.toml` are preserved across an edit.
+The Add node tab performs the same work as `frpctl node add`, with `Preflight` for a dry run and `Deploy` for the real thing. The Mapping tab adds a mapping or, once `e` has loaded one (Enter does the same), saves changes to it; `locations` and any extra keys carried over from an imported `frpc.toml` are preserved across an edit. `e` on a Nodes row opens a modal that edits that node's connection info — host, user, SSH port, key file, jump host, both proxies and FRP version — the same fields as `frpctl node edit`; it only records desired state, so sync the node to apply the change.
 
-`c` on a Nodes row turns that tab into `frpctl node clone`: the SSH user, port and proxy are prefilled from the source, the client is set to the one the source serves, and a banner at the top names the source together with the FRP settings the twin will inherit. Type the new host, fill in the passwords and press `Deploy`. `Reset` clears the form and forgets the source, so the next deploy inherits nothing.
+`c` on a Nodes row turns that tab into `frpctl node clone`: the SSH user, port, outbound proxy and SSH SOCKS proxy are prefilled from the source, the client is set to the one the source serves, and a banner at the top names the source together with the FRP settings the twin will inherit. Type the new host, fill in the passwords and press `Deploy`. `Reset` clears the form and forgets the source, so the next deploy inherits nothing.
 
 ## Build x86_64 artifacts
 
@@ -210,6 +222,23 @@ Because the exports live inside the shell that `sudo` starts, this needs **no** 
 One command deliberately opts out: the ACME challenge probe in `frpdomain apply` runs with `proxy=False`, because it has to travel the public DNS/CDN path back to the node's own Nginx and a proxy would validate the wrong route.
 
 Preflight now proves reachability before anything is installed. `frpctl node add --dry-run` (or `Preflight` in the TUI) fetches `frp_sha256_checksums.txt` from both hosts with a 25 second ceiling and reports `node-frp-download` / `client-frp-download`, quoting curl's own error and the proxy in use. Previously a blocked route surfaced only as a three-minute stall inside `install_frp`, where curl is allowed three retries under a 180 second timeout.
+
+## SSH through a SOCKS proxy
+
+The outbound proxy above is resolved *on the target*. Its counterpart, `ssh.ssh_proxy`, is resolved **on the controller**: it is the SOCKS proxy this machine dials the host's SSH port through, for a node whose SSH is only reachable that way — behind a bastion's `ssh -D`, a corporate SOCKS gateway or Tor.
+
+```bash
+# the node's SSH is only reachable through a local SOCKS proxy
+sudo frpctl node add 10.8.0.7 --user root --ssh-proxy socks5h://127.0.0.1:1080
+
+# a clone keeps the source's SSH proxy unless you override or drop it
+sudo frpctl node clone node-10-8-0-7 10.8.0.9 --ssh-proxy socks5h://127.0.0.1:9050
+sudo frpctl node clone node-10-8-0-7 10.8.0.9 --no-ssh-proxy
+```
+
+`node add` takes `--ssh-proxy`, `node clone` also takes `--no-ssh-proxy`, `node edit --ssh-proxy` sets or clears it on an existing node, and the Add node tab in the TUI has an SSH-proxy field (prefilled from the source when you clone). `frpctl node list` shows it in the `SSH via` column.
+
+Only SOCKS schemes are accepted — `socks4`, `socks4a`, `socks5`, `socks5h` — because PySocks tunnels the whole SSH connection over them; `socks5h`/`socks4a` resolve the node's hostname on the proxy side, which is what a name only the proxy can resolve needs. It is **mutually exclusive with `proxy_jump`**: a host reaches its SSH either through a SOCKS proxy or through a jump host, not both. The SOCKS socket is handed to Paramiko exactly like a jump-host channel, so key, password and sudo handling are unchanged.
 
 ## Per-node Domains and Automatic HTTPS
 

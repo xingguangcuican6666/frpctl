@@ -4,7 +4,7 @@ from textual.widgets import DataTable, Input, TabbedContent
 
 from frpctl.inventory import InventoryStore
 from frpctl.models import Client, Inventory, Mapping, Node, SSHConfig
-from frpctl.tui import ConfirmScreen, FrpCtlApp, ProxyScreen
+from frpctl.tui import ConfirmScreen, FrpCtlApp, NodeEditScreen, ProxyScreen
 
 
 def seed(tmp_path):
@@ -219,6 +219,7 @@ def test_clone_key_prefills_the_add_node_form_from_the_source(tmp_path):
         inventory = store.load()
         inventory.node("node-a").ssh.port = 2222
         inventory.node("node-a").ssh.http_proxy = "http://10.0.0.8:3128"
+        inventory.node("node-a").ssh.ssh_proxy = "socks5h://127.0.0.1:1080"
         store.save(inventory)
 
     async def scenario(app, pilot):
@@ -232,6 +233,9 @@ def test_clone_key_prefills_the_add_node_form_from_the_source(tmp_path):
         assert app.query_one("#node-user", Input).value == "root"
         assert app.query_one("#node-port", Input).value == "2222"
         assert app.query_one("#node-proxy", Input).value == "http://10.0.0.8:3128"
+        assert (
+            app.query_one("#node-ssh-proxy", Input).value == "socks5h://127.0.0.1:1080"
+        )
         assert app.query_one("#client-id", Input).value == "client-109"
 
     drive(tmp_path, scenario, prepare)
@@ -242,13 +246,29 @@ def test_reset_button_forgets_the_clone_source(tmp_path):
         await pilot.press("c")
         await pilot.pause()
         assert app.clone_from == "node-a"
+        app.query_one("#node-ssh-proxy", Input).value = "socks5h://127.0.0.1:1080"
         app.reset_node_form()
         await pilot.pause()
         assert app.clone_from is None
         assert app.query_one("#node-user", Input).value == ""
         assert app.query_one("#node-port", Input).value == "22"
+        assert app.query_one("#node-ssh-proxy", Input).value == ""
 
     drive(tmp_path, scenario)
+
+
+def test_nodes_table_shows_the_ssh_proxy(tmp_path):
+    def prepare(store):
+        inventory = store.load()
+        inventory.node("node-a").ssh.ssh_proxy = "socks5h://127.0.0.1:1080"
+        store.save(inventory)
+
+    async def scenario(app, pilot):
+        del pilot
+        row = app.query_one("#nodes", DataTable).get_row("node-a")
+        assert row[7] == "socks5h://127.0.0.1:1080"
+
+    drive(tmp_path, scenario, prepare)
 
 
 def test_clone_needs_a_node_row(tmp_path):
@@ -271,5 +291,81 @@ def test_sync_needs_a_node_row(tmp_path):
         await pilot.pause()
         # The mappings table cannot identify a node, so no modal is pushed.
         assert app.screen is app.query_one("#nodes", DataTable).screen
+
+    drive(tmp_path, scenario)
+
+
+def test_edit_key_on_a_node_opens_the_editor_prefilled(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        assert isinstance(app.screen, NodeEditScreen)
+        assert app.screen.query_one("#edit-host", Input).value == "203.0.113.10"
+        assert app.screen.query_one("#edit-user", Input).value == "root"
+        # The SSH port, not the tunnel port, prefills this field.
+        assert app.screen.query_one("#edit-port", Input).value == "22"
+        assert app.screen.query_one("#edit-frp-version", Input).value == "0.70.0"
+
+    drive(tmp_path, scenario)
+
+
+def test_saving_the_node_editor_updates_the_node(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        app.screen.query_one("#edit-host", Input).value = "203.0.113.99"
+        app.screen.query_one("#edit-user", Input).value = "admin"
+        app.screen.query_one(
+            "#edit-ssh-proxy", Input
+        ).value = "socks5h://127.0.0.1:1080"
+        app.screen.save()
+        await pilot.pause()
+
+    store = drive(tmp_path, scenario)
+    node = store.load().node("node-a")
+    assert node.ssh.host == "203.0.113.99"
+    assert node.ssh.user == "admin"
+    assert node.ssh.ssh_proxy == "socks5h://127.0.0.1:1080"
+
+
+def test_clearing_the_ssh_proxy_in_the_editor_stores_none(tmp_path):
+    def prepare(store):
+        inventory = store.load()
+        inventory.node("node-a").ssh.ssh_proxy = "socks5h://127.0.0.1:1080"
+        store.save(inventory)
+
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        assert (
+            app.screen.query_one("#edit-ssh-proxy", Input).value
+            == "socks5h://127.0.0.1:1080"
+        )
+        app.screen.query_one("#edit-ssh-proxy", Input).value = ""
+        app.screen.save()
+        await pilot.pause()
+
+    store = drive(tmp_path, scenario, prepare)
+    assert store.load().node("node-a").ssh.ssh_proxy is None
+
+
+def test_the_node_editor_rejects_an_invalid_ssh_proxy(tmp_path):
+    async def scenario(app, pilot):
+        await pilot.press("e")
+        app.screen.query_one("#edit-ssh-proxy", Input).value = "http://127.0.0.1:7890"
+        app.screen.save()
+        await pilot.pause()
+
+    store = drive(tmp_path, scenario)
+    assert store.load().node("node-a").ssh.ssh_proxy is None
+
+
+def test_edit_key_on_a_mapping_still_prefills_the_mapping_form(tmp_path):
+    async def scenario(app, pilot):
+        mappings = app.query_one("#mappings", DataTable)
+        mappings.focus()
+        mappings.move_cursor(row=1)
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+        assert app.query_one("#tabs", TabbedContent).active == "mapping"
+        assert app.query_one("#map-id", Input).value == "api"
 
     drive(tmp_path, scenario)

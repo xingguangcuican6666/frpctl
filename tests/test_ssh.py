@@ -1,5 +1,7 @@
 import shlex
 
+import pytest
+
 from frpctl.models import SSHConfig
 from frpctl.ssh import CommandResult, SSHExecutor
 
@@ -92,3 +94,96 @@ def test_proxy_url_is_shell_quoted():
 def test_command_result_ok():
     assert CommandResult("", "", 0).ok
     assert not CommandResult("", "boom", 7).ok
+
+
+@pytest.mark.parametrize(
+    "scheme,expected_type,expected_rdns",
+    [
+        ("socks4", "SOCKS4", False),
+        ("socks4a", "SOCKS4", True),
+        ("socks5", "SOCKS5", False),
+        ("socks5h", "SOCKS5", True),
+    ],
+)
+def test_socks_scheme_maps_to_pysocks(
+    monkeypatch, scheme, expected_type, expected_rdns
+):
+    import socks
+
+    captured = {}
+
+    def fake_create_connection(dest, **kwargs):
+        captured["dest"] = dest
+        captured.update(kwargs)
+        return "SOCKSOCK"
+
+    monkeypatch.setattr(socks, "create_connection", fake_create_connection)
+    remote, _ = executor(ssh_proxy=f"{scheme}://user:pw@10.0.0.5:1080")
+    remote.config.host = "node.internal"
+    remote.config.port = 2222
+
+    assert remote._socks_socket() == "SOCKSOCK"
+    assert captured["dest"] == ("node.internal", 2222)
+    assert captured["proxy_addr"] == "10.0.0.5"
+    assert captured["proxy_port"] == 1080
+    assert captured["proxy_rdns"] is expected_rdns
+    assert captured["proxy_username"] == "user"
+    assert captured["proxy_password"] == "pw"
+    assert captured["proxy_type"] == getattr(socks, expected_type)
+
+
+def test_ssh_proxy_is_handed_to_paramiko_as_the_socket(monkeypatch):
+    import paramiko
+    import socks
+
+    monkeypatch.setattr(socks, "create_connection", lambda dest, **kwargs: "SOCKSOCK")
+
+    class FakeParamiko:
+        def __init__(self):
+            self.kwargs = None
+
+        def set_missing_host_key_policy(self, _policy):
+            return None
+
+        def connect(self, **kwargs):
+            self.kwargs = kwargs
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeParamiko)
+    remote = SSHExecutor(
+        SSHConfig("node.internal", "root", 22, ssh_proxy="socks5h://127.0.0.1:1080")
+    )
+    remote.connect()
+    assert remote.client.kwargs["sock"] == "SOCKSOCK"
+
+
+def test_ssh_proxy_takes_precedence_over_a_jump_host(monkeypatch):
+    """An SSH SOCKS proxy owns the socket; the jump path must not also run."""
+    import paramiko
+    import socks
+
+    monkeypatch.setattr(socks, "create_connection", lambda dest, **kwargs: "SOCKSOCK")
+
+    class FakeParamiko:
+        def set_missing_host_key_policy(self, _policy):
+            return None
+
+        def connect(self, **kwargs):
+            self.kwargs = kwargs
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeParamiko)
+    remote = SSHExecutor(
+        SSHConfig(
+            "node.internal",
+            "root",
+            ssh_proxy="socks5h://127.0.0.1:1080",
+            proxy_jump="bastion",
+        )
+    )
+    remote.connect()
+    assert remote.client.kwargs["sock"] == "SOCKSOCK"

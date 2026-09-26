@@ -149,6 +149,92 @@ class ProxyScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class NodeEditScreen(ModalScreen[dict[str, str] | None]):
+    """Edit an existing node's connection info; nothing is deployed here."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+    CSS = """
+    NodeEditScreen { align: center middle; }
+    #node-edit-box {
+        width: 78; height: auto; max-height: 90%; padding: 1 2;
+        border: round $accent; background: $surface;
+    }
+    #node-edit-box Input { margin-bottom: 1; }
+    #node-edit-box .field { color: $text-muted; }
+    #node-edit-box Button { margin-right: 1; }
+    """
+
+    # (attribute, label, placeholder); host/user/port/version fall back to the
+    # current value when blank, the nullable fields below are cleared by a blank.
+    FIELDS: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        ("host", "Public host", "198.51.100.20"),
+        ("user", "SSH user", "ubuntu"),
+        ("port", "SSH port", "22"),
+        ("key_file", "SSH key file (blank clears it)", "~/.ssh/id_ed25519"),
+        ("proxy_jump", "SSH jump host (blank clears it)", "bastion"),
+        (
+            "http_proxy",
+            "Outbound proxy on the node (blank clears it)",
+            "http://127.0.0.1:7890",
+        ),
+        (
+            "ssh_proxy",
+            "SSH SOCKS proxy on this machine (blank clears it)",
+            "socks5h://127.0.0.1:1080",
+        ),
+        ("frp_version", "FRP version installed on the next sync", "0.70.0"),
+    )
+
+    def __init__(self, node: Node) -> None:
+        super().__init__()
+        self.node = node
+        self.current = {
+            "host": node.ssh.host,
+            "user": node.ssh.user,
+            "port": str(node.ssh.port),
+            "key_file": node.ssh.key_file or "",
+            "proxy_jump": node.ssh.proxy_jump or "",
+            "http_proxy": node.ssh.http_proxy or "",
+            "ssh_proxy": node.ssh.ssh_proxy or "",
+            "frp_version": node.frp_version,
+        }
+
+    @staticmethod
+    def selector(key: str) -> str:
+        return f"#edit-{key.replace('_', '-')}"
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="node-edit-box"):
+            yield Label(f"Edit node {self.node.id}")
+            for key, label, placeholder in self.FIELDS:
+                yield Label(label, classes="field")
+                yield Input(
+                    value=self.current[key],
+                    placeholder=placeholder,
+                    id=self.selector(key)[1:],
+                    type="integer" if key == "port" else "text",
+                )
+            with Horizontal():
+                yield Button("Save", id="node-edit-save", variant="success")
+                yield Button("Cancel", id="node-edit-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#edit-host", Input).focus()
+
+    @on(Button.Pressed, "#node-edit-save")
+    def save(self) -> None:
+        self.dismiss(
+            {
+                key: self.query_one(self.selector(key), Input).value.strip()
+                for key, _, _ in self.FIELDS
+            }
+        )
+
+    @on(Button.Pressed, "#node-edit-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class FrpCtlApp(LogPaneMixin, App):
     TITLE = "FRP Multi-node Manager"
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -210,6 +296,10 @@ class FrpCtlApp(LogPaneMixin, App):
             yield Input(value="22", id="node-port", type="integer")
             yield Label("Outbound proxy on the node (blank for none)", classes="field")
             yield Input(placeholder="http://127.0.0.1:7890", id="node-proxy")
+            yield Label(
+                "SSH SOCKS proxy on this machine (blank for none)", classes="field"
+            )
+            yield Input(placeholder="socks5h://127.0.0.1:1080", id="node-ssh-proxy")
             yield Label("SSH password (blank uses key auth)", classes="field")
             yield Input(password=True, id="node-password")
             yield Label("sudo password (empty if not required)", classes="field")
@@ -248,7 +338,9 @@ class FrpCtlApp(LogPaneMixin, App):
 
     def on_mount(self) -> None:
         nodes = self.query_one("#nodes", DataTable)
-        nodes.add_columns("ID", "Host", "User", "Tunnel", "Mode", "Clients", "Proxy")
+        nodes.add_columns(
+            "ID", "Host", "User", "Tunnel", "Mode", "Clients", "Proxy", "SSH via"
+        )
         mappings = self.query_one("#mappings", DataTable)
         mappings.add_columns("Client", "ID", "Protocol", "Local", "Remote")
         for table in (nodes, mappings):
@@ -280,6 +372,7 @@ class FrpCtlApp(LogPaneMixin, App):
                 "legacy" if node.legacy_tunnel else "managed",
                 ", ".join(attached) or "-",
                 node.ssh.http_proxy or "-",
+                node.ssh.ssh_proxy or "-",
                 key=node.id,
             )
         for client in inventory.clients:
@@ -439,6 +532,7 @@ class FrpCtlApp(LogPaneMixin, App):
             "#node-user": source.ssh.user,
             "#node-port": str(source.ssh.port),
             "#node-proxy": source.ssh.http_proxy or "",
+            "#node-ssh-proxy": source.ssh.ssh_proxy or "",
             "#client-id": client.id,
         }
         for selector, value in fields.items():
@@ -463,7 +557,13 @@ class FrpCtlApp(LogPaneMixin, App):
 
     @on(Button.Pressed, "#node-reset")
     def reset_node_form(self) -> None:
-        for selector in ("#node-id", "#node-host", "#node-user", "#node-proxy"):
+        for selector in (
+            "#node-id",
+            "#node-host",
+            "#node-user",
+            "#node-proxy",
+            "#node-ssh-proxy",
+        ):
             self.query_one(selector, Input).value = ""
         self.query_one("#node-port", Input).value = "22"
         self.clone_from = None
@@ -471,11 +571,51 @@ class FrpCtlApp(LogPaneMixin, App):
         self.write_log("Node form reset; nothing will be inherited")
 
     def action_edit_selected(self) -> None:
-        found = self.selection("mappings")
+        found = self.selection()
         if found is None:
             return
-        client_id, _, mapping_id = found[1].partition("/")
+        table, key = found
+        if table.id == "nodes":
+            self.edit_node(key)
+            return
+        client_id, _, mapping_id = key.partition("/")
         self.load_mapping_form(client_id, mapping_id)
+
+    def edit_node(self, node_id: str) -> None:
+        try:
+            node = self.store.load().node(node_id)
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        self.push_screen(
+            NodeEditScreen(node),
+            lambda values: self.save_node_edit(node_id, values),
+        )
+
+    def save_node_edit(self, node_id: str, values: dict[str, str] | None) -> None:
+        if values is None:
+            self.write_log("Node unchanged")
+            return
+        try:
+            with self.store.lock():
+                inventory = self.store.load()
+                node = inventory.node(node_id)
+                ssh = node.ssh
+                ssh.host = values["host"] or ssh.host
+                ssh.user = values["user"] or ssh.user
+                ssh.port = int(values["port"]) if values["port"] else ssh.port
+                ssh.key_file = values["key_file"] or None
+                ssh.proxy_jump = values["proxy_jump"] or None
+                ssh.http_proxy = values["http_proxy"] or None
+                ssh.ssh_proxy = values["ssh_proxy"] or None
+                node.frp_version = values["frp_version"] or node.frp_version
+                inventory.validate()
+                self.store.save(inventory)
+        except Exception as exc:
+            self.write_log(f"ERROR {exc}", "error")
+            return
+        self.write_log(f"Updated node {node_id}; sync it to apply the change", "ok")
+        self.refresh_tables()
 
     @on(DataTable.RowSelected, "#mappings")
     def edit_row(self, event: DataTable.RowSelected) -> None:
@@ -691,6 +831,7 @@ class FrpCtlApp(LogPaneMixin, App):
             "user": value("#node-user"),
             "port": value("#node-port") or "22",
             "proxy": value("#node-proxy"),
+            "ssh_proxy": value("#node-ssh-proxy"),
             "client_id": value("#client-id"),
             "clone_from": self.clone_from or "",
         }
@@ -743,6 +884,7 @@ class FrpCtlApp(LogPaneMixin, App):
                 form["user"],
                 int(form["port"]),
                 http_proxy=form["proxy"] or None,
+                ssh_proxy=form["ssh_proxy"] or None,
             )
             tunnel_port = inventory.next_tunnel_port()
             if form["clone_from"]:

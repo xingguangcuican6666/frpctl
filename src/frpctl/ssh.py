@@ -5,6 +5,7 @@ import getpass
 import shlex
 from collections.abc import Iterable
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .errors import RemoteError
 from .models import SSHConfig
@@ -62,7 +63,10 @@ class SSHExecutor:
             kwargs["key_filename"] = self.config.key_file
         if self.password:
             kwargs["password"] = self.password
-        if self.config.proxy_jump:
+        if self.config.ssh_proxy:
+            self._proxy = self._socks_socket()
+            kwargs["sock"] = self._proxy
+        elif self.config.proxy_jump:
             jump = self._parse_jump(self.config.proxy_jump)
             jump_client = paramiko.SSHClient()
             jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -94,6 +98,43 @@ class SSHExecutor:
         else:
             user, host = getpass.getuser(), user_host
         return {"user": user, "host": host, "port": int(port_text)}
+
+    def _socks_socket(self):
+        """Open a socket to this host's SSH port through its SOCKS proxy.
+
+        PySocks resolves the URL on the controller and tunnels the TCP
+        connection; the resulting socket is handed to Paramiko as ``sock=``,
+        exactly like a jump-host channel. ``socks5h``/``socks4a`` resolve the
+        target's name on the proxy side, which is what a name only the proxy can
+        resolve needs.
+        """
+        try:
+            import socks
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise RemoteError("PySocks is required for an SSH SOCKS proxy") from exc
+        parsed = urlparse(self.config.ssh_proxy)
+        proxy_type, remote_dns = {
+            "socks4": (socks.SOCKS4, False),
+            "socks4a": (socks.SOCKS4, True),
+            "socks5": (socks.SOCKS5, False),
+            "socks5h": (socks.SOCKS5, True),
+        }[parsed.scheme]
+        try:
+            return socks.create_connection(
+                (self.config.host, self.config.port),
+                timeout=15,
+                proxy_type=proxy_type,
+                proxy_addr=parsed.hostname,
+                proxy_port=parsed.port,
+                proxy_rdns=remote_dns,
+                proxy_username=parsed.username,
+                proxy_password=parsed.password,
+            )
+        except OSError as exc:
+            raise RemoteError(
+                f"SSH SOCKS proxy {parsed.hostname}:{parsed.port} could not reach "
+                f"{self.config.host}:{self.config.port}: {exc}"
+            ) from exc
 
     def proxy_prefix(self) -> str:
         """Shell prologue exporting the target host's own outbound proxy.

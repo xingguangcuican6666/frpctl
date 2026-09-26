@@ -64,6 +64,40 @@ def test_proxy_with_whitespace_is_rejected():
         inv.validate()
 
 
+def test_ssh_proxy_survives_a_yaml_roundtrip():
+    inv = sample_inventory()
+    inv.nodes[0].ssh.ssh_proxy = "socks5h://127.0.0.1:1080"
+    restored = Inventory.from_dict(inv.to_dict())
+    assert restored.node("node-123").ssh.ssh_proxy == "socks5h://127.0.0.1:1080"
+
+
+def test_ssh_proxy_defaults_to_none():
+    assert SSHConfig("h", "u").ssh_proxy is None
+    restored = Inventory.from_dict(
+        {
+            "nodes": [
+                {"id": "n", "ssh": {"host": "h", "user": "u"}, "tunnel_port": 17000}
+            ]
+        }
+    )
+    assert restored.node("n").ssh.ssh_proxy is None
+
+
+def test_ssh_proxy_must_be_a_socks_url():
+    inv = sample_inventory()
+    inv.nodes[0].ssh.ssh_proxy = "http://127.0.0.1:7890"
+    with pytest.raises(ValidationError, match="invalid node node-123 ssh proxy"):
+        inv.validate()
+
+
+def test_ssh_proxy_and_proxy_jump_are_mutually_exclusive():
+    inv = sample_inventory()
+    inv.nodes[0].ssh.ssh_proxy = "socks5h://127.0.0.1:1080"
+    inv.nodes[0].ssh.proxy_jump = "bastion"
+    with pytest.raises(ValidationError, match="only one of ssh_proxy or proxy_jump"):
+        inv.validate()
+
+
 def test_missing_proxy_key_defaults_to_none():
     restored = Inventory.from_dict(
         {

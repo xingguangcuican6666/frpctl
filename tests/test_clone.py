@@ -59,6 +59,14 @@ def test_cloned_ssh_does_not_alias_the_source():
     assert source.http_proxy == "http://127.0.0.1:7890"
 
 
+def test_cloned_ssh_inherits_and_can_drop_the_ssh_proxy():
+    source = SSHConfig("203.0.113.10", "root", ssh_proxy="socks5h://127.0.0.1:1080")
+    assert cloned_ssh(source, "198.51.100.20").ssh_proxy == "socks5h://127.0.0.1:1080"
+    dropped = cloned_ssh(source, "198.51.100.20")
+    dropped.ssh_proxy = None
+    assert source.ssh_proxy == "socks5h://127.0.0.1:1080"
+
+
 def test_cloned_node_copies_every_frp_setting():
     source = source_node()
     ssh = cloned_ssh(source.ssh, "198.51.100.20")

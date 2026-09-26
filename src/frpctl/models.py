@@ -17,6 +17,8 @@ PROXY_SCHEMES = (
     "socks5://",
     "socks5h://",
 )
+# Schemes usable as an SSH transport proxy; PySocks tunnels the connection.
+SOCKS_SCHEMES = ("socks4://", "socks4a://", "socks5://", "socks5h://")
 
 
 def validate_id(kind: str, value: str) -> None:
@@ -37,6 +39,34 @@ def validate_proxy(kind: str, value: str | None) -> None:
         )
 
 
+def validate_ssh_proxy(kind: str, value: str | None) -> None:
+    """Reject SSH transport proxies that PySocks could not use.
+
+    Only SOCKS URLs are accepted: this proxy carries the SSH connection itself,
+    which PySocks tunnels over SOCKS, unlike ``http_proxy`` which merely names
+    the outbound proxy exported into remote commands.
+    """
+    if value is None:
+        return
+    if not value or any(character.isspace() for character in value):
+        raise ValidationError(f"invalid {kind} ssh proxy: {value!r}")
+    if not value.startswith(SOCKS_SCHEMES):
+        raise ValidationError(
+            f"invalid {kind} ssh proxy: {value!r}; expected a URL starting with "
+            + ", ".join(SOCKS_SCHEMES)
+        )
+
+
+def validate_ssh(kind: str, ssh: SSHConfig) -> None:
+    """Validate the reachability settings of one host's SSH config."""
+    validate_proxy(kind, ssh.http_proxy)
+    validate_ssh_proxy(kind, ssh.ssh_proxy)
+    if ssh.ssh_proxy and ssh.proxy_jump:
+        raise ValidationError(
+            f"invalid {kind} ssh: set only one of ssh_proxy or proxy_jump"
+        )
+
+
 @dataclass(slots=True)
 class SSHConfig:
     host: str
@@ -51,6 +81,14 @@ class SSHConfig:
     It is exported inside every remote command, so the value is resolved on the
     target machine: ``http://127.0.0.1:7890`` means the proxy running there, not
     one reachable from the controller.
+    """
+    ssh_proxy: str | None = None
+    """SOCKS proxy the controller routes this host's SSH connection through.
+
+    Unlike ``http_proxy``, this is resolved on the machine running frpctl, not
+    on the target: ``socks5h://127.0.0.1:1080`` means a proxy listening on the
+    controller. It reaches a host whose SSH is only accessible through a SOCKS
+    proxy, and is mutually exclusive with ``proxy_jump``.
     """
 
     @classmethod
@@ -162,7 +200,7 @@ class Inventory:
             raise ValidationError("duplicate local tunnel port")
         for client in self.clients:
             validate_id("client", client.id)
-            validate_proxy(f"client {client.id}", client.ssh.http_proxy)
+            validate_ssh(f"client {client.id}", client.ssh)
             unknown = set(client.node_ids) - known_nodes
             if unknown:
                 raise ValidationError(
@@ -183,7 +221,7 @@ class Inventory:
                     ports.add(key)
         for node in self.nodes:
             validate_id("node", node.id)
-            validate_proxy(f"node {node.id}", node.ssh.http_proxy)
+            validate_ssh(f"node {node.id}", node.ssh)
             if not 1024 <= node.tunnel_port <= 65535:
                 raise ValidationError(
                     f"invalid tunnel port for {node.id}: {node.tunnel_port}"
