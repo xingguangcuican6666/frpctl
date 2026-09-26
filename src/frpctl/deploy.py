@@ -4,6 +4,7 @@ import secrets
 import shlex
 import time
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .errors import DeploymentError, ValidationError
 from .frp import effective_remote_port, render_frpc, render_frps
@@ -24,6 +25,60 @@ ARCH_MAP = {
 
 def release_base(version: str) -> str:
     return f"{FRP_RELEASES}/v{version}"
+
+
+def tunnel_proxy_command(ssh_proxy: str | None) -> str:
+    """Return the ssh ``ProxyCommand`` value the client tunnel dials through.
+
+    The ``frp-tunnel@`` unit runs on the client and connects to the node's SSH
+    port. When the node is only reachable through a SOCKS proxy that listens on
+    the client itself (e.g. ``socks5h://127.0.0.1:7891``), OpenBSD netcat runs
+    the SOCKS handshake: ``-X 5`` selects SOCKS5, ``-X 4`` SOCKS4. ``%h``/``%p``
+    are expanded by ssh, not systemd. ``none`` disables proxying so ssh dials
+    the host directly.
+
+    ``nc`` only authenticates HTTP CONNECT proxies, so a username is forwarded
+    best-effort and a password in the URL cannot be carried.
+    """
+    if not ssh_proxy:
+        return "none"
+    parsed = urlparse(ssh_proxy)
+    version = "4" if parsed.scheme in ("socks4", "socks4a") else "5"
+    endpoint = parsed.hostname or ""
+    if parsed.port:
+        endpoint = f"{endpoint}:{parsed.port}"
+    auth = f" -P {shlex.quote(parsed.username)}" if parsed.username else ""
+    return f"nc -X {version} -x {endpoint}{auth} %h %p"
+
+
+def tunnel_key_paths(node: Node) -> tuple[str, str]:
+    """Return the ``(key, known_hosts)`` paths for a node's client tunnel."""
+    return (
+        f"/etc/frp-manager/keys/{node.id}_ed25519",
+        f"/etc/frp-manager/keys/{node.id}_known_hosts",
+    )
+
+
+def tunnel_env_file(node: Node, key: str, known_hosts: str) -> str:
+    """Render the ``EnvironmentFile`` the ``frp-tunnel@`` unit reads.
+
+    ``PROXY_OPT`` is always written so the shared unit's ``-o ${PROXY_OPT}``
+    resolves to a real argument (``ProxyCommand=none`` when no SOCKS proxy is
+    set); an absent value would expand to an empty ``-o`` and break ssh.
+    """
+    return "\n".join(
+        [
+            f"LOCAL_PORT={node.tunnel_port}",
+            f"REMOTE_PORT={node.frps_bind_port}",
+            f"KEY_FILE={key}",
+            f"KNOWN_HOSTS={known_hosts}",
+            f"SSH_USER={node.ssh.user}",
+            f"SSH_HOST={node.ssh.host}",
+            f"SSH_PORT={node.ssh.port}",
+            f"PROXY_OPT=ProxyCommand={tunnel_proxy_command(node.ssh.ssh_proxy)}",
+            "",
+        ]
+    )
 
 
 FRPS_UNIT = """[Unit]
@@ -65,7 +120,7 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/etc/frp/tunnels/%i.env
-ExecStart=/usr/bin/ssh -N -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} -i ${KEY_FILE} -p ${SSH_PORT} -o BatchMode=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} ${SSH_USER}@${SSH_HOST}
+ExecStart=/usr/bin/ssh -N -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} -i ${KEY_FILE} -p ${SSH_PORT} -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ${PROXY_OPT} ${SSH_USER}@${SSH_HOST}
 Restart=always
 RestartSec=3
 
@@ -293,6 +348,7 @@ class Deployer:
         client_service = (
             "frpc.service" if node.legacy_tunnel else f"frpc@{node.id}.service"
         )
+        tunnel_env = f"/etc/frp/tunnels/{node.id}.env"
         node_remote.run(
             "cp -a /etc/frp/frps.toml /etc/frp/frps.toml.frpctl-backup 2>/dev/null || true",
             sudo=True,
@@ -301,6 +357,11 @@ class Deployer:
             f"cp -a {shlex.quote(client_config)} {shlex.quote(client_config)}.frpctl-backup 2>/dev/null || true",
             sudo=True,
         )
+        if not node.legacy_tunnel:
+            client_remote.run(
+                f"cp -a {shlex.quote(tunnel_env)} {shlex.quote(tunnel_env)}.frpctl-backup 2>/dev/null || true",
+                sudo=True,
+            )
         try:
             node_remote.write_atomic(
                 "/etc/frp/frps.toml", render_frps(node, client, token), mode=0o600
@@ -310,10 +371,24 @@ class Deployer:
                 render_frpc(node, client, token),
                 mode=0o600,
             )
+            if not node.legacy_tunnel:
+                key, known_hosts = tunnel_key_paths(node)
+                client_remote.write_atomic(
+                    tunnel_env, tunnel_env_file(node, key, known_hosts), mode=0o600
+                )
+                client_remote.write_atomic(
+                    "/etc/systemd/system/frp-tunnel@.service", TUNNEL_UNIT, mode=0o644
+                )
             node_remote.run(
                 "/usr/local/bin/frps verify -c /etc/frp/frps.toml; systemctl restart frps.service; systemctl is-active --quiet frps.service",
                 sudo=True,
             )
+            if not node.legacy_tunnel:
+                client_remote.run(
+                    f"systemctl daemon-reload; systemctl restart frp-tunnel@{shlex.quote(node.id)}.service; "
+                    f"systemctl is-active --quiet frp-tunnel@{shlex.quote(node.id)}.service",
+                    sudo=True,
+                )
             client_remote.run(
                 f"/usr/local/bin/frpc verify -c {shlex.quote(client_config)}; systemctl restart {shlex.quote(client_service)}; systemctl is-active --quiet {shlex.quote(client_service)}",
                 sudo=True,
@@ -334,6 +409,13 @@ class Deployer:
                 sudo=True,
                 check=False,
             )
+            if not node.legacy_tunnel:
+                client_remote.run(
+                    f"test ! -f {shlex.quote(tunnel_env)}.frpctl-backup || {{ mv -f {shlex.quote(tunnel_env)}.frpctl-backup {shlex.quote(tunnel_env)}; "
+                    f"systemctl daemon-reload; systemctl restart frp-tunnel@{shlex.quote(node.id)}.service; }}",
+                    sudo=True,
+                    check=False,
+                )
             client_remote.run(
                 f"test ! -f {shlex.quote(client_config)}.frpctl-backup || {{ mv -f {shlex.quote(client_config)}.frpctl-backup {shlex.quote(client_config)}; systemctl restart {shlex.quote(client_service)}; }}",
                 sudo=True,
@@ -445,8 +527,7 @@ class Deployer:
         if dry_run:
             return
         self.install_frp(node, client_remote, "frpc")
-        key = f"/etc/frp-manager/keys/{node.id}_ed25519"
-        known_hosts = f"/etc/frp-manager/keys/{node.id}_known_hosts"
+        key, known_hosts = tunnel_key_paths(node)
         client_remote.run(
             f"mkdir -p /etc/frp-manager/keys /etc/frp/clients /etc/frp/tunnels; if [ ! -f {shlex.quote(key)} ]; then ssh-keygen -q -t ed25519 -N '' -f {shlex.quote(key)}; fi; ssh-keyscan -p {node.ssh.port} {shlex.quote(node.ssh.host)} > {shlex.quote(known_hosts)}; chmod 600 {shlex.quote(key)} {shlex.quote(known_hosts)}",
             sudo=True,
@@ -467,18 +548,7 @@ class Deployer:
         )
         client_remote.write_atomic(
             f"/etc/frp/tunnels/{node.id}.env",
-            "\n".join(
-                [
-                    f"LOCAL_PORT={node.tunnel_port}",
-                    f"REMOTE_PORT={node.frps_bind_port}",
-                    f"KEY_FILE={key}",
-                    f"KNOWN_HOSTS={known_hosts}",
-                    f"SSH_USER={node.ssh.user}",
-                    f"SSH_HOST={node.ssh.host}",
-                    f"SSH_PORT={node.ssh.port}",
-                    "",
-                ]
-            ),
+            tunnel_env_file(node, key, known_hosts),
             mode=0o600,
         )
         client_remote.write_atomic(

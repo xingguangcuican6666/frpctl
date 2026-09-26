@@ -83,12 +83,16 @@ class SSHConfig:
     one reachable from the controller.
     """
     ssh_proxy: str | None = None
-    """SOCKS proxy the controller routes this host's SSH connection through.
+    """SOCKS proxy that carries this host's SSH connection.
 
-    Unlike ``http_proxy``, this is resolved on the machine running frpctl, not
-    on the target: ``socks5h://127.0.0.1:1080`` means a proxy listening on the
-    controller. It reaches a host whose SSH is only accessible through a SOCKS
-    proxy, and is mutually exclusive with ``proxy_jump``.
+    Unlike ``http_proxy`` (resolved on the target), this SOCKS proxy is dialed
+    from wherever the SSH connection originates: ``socks5h://127.0.0.1:1080``
+    names a proxy on that originating machine. The controller routes its own
+    management SSH through it via PySocks; for a node it additionally becomes
+    the ``ProxyCommand`` of the client's persistent ``frp-tunnel@`` unit, so the
+    same loopback proxy must also be reachable on the client. It reaches a host
+    whose SSH is only accessible through a SOCKS proxy, and is mutually
+    exclusive with ``proxy_jump``.
     """
 
     @classmethod

@@ -225,7 +225,7 @@ Preflight now proves reachability before anything is installed. `frpctl node add
 
 ## SSH through a SOCKS proxy
 
-The outbound proxy above is resolved *on the target*. Its counterpart, `ssh.ssh_proxy`, is resolved **on the controller**: it is the SOCKS proxy this machine dials the host's SSH port through, for a node whose SSH is only reachable that way — behind a bastion's `ssh -D`, a corporate SOCKS gateway or Tor.
+The outbound proxy above is resolved *on the target*. Its counterpart, `ssh.ssh_proxy`, is dialed from wherever the SSH connection *starts*: it is a SOCKS proxy used to reach a host whose SSH is only accessible that way — behind a bastion's `ssh -D`, a corporate SOCKS gateway or Tor. For a node it has two consumers. The controller dials its management SSH through it (via PySocks), **and** the client's persistent `frp-tunnel@<node>` unit dials the node's SSH through it too, as an `ssh -o ProxyCommand=…`. Both originate the same connection to the node, so when the proxy is a loopback address like `socks5h://127.0.0.1:7891` it must be listening on *each* machine that dials — the controller and the client.
 
 ```bash
 # the node's SSH is only reachable through a local SOCKS proxy
@@ -239,6 +239,10 @@ sudo frpctl node clone node-10-8-0-7 10.8.0.9 --no-ssh-proxy
 `node add` takes `--ssh-proxy`, `node clone` also takes `--no-ssh-proxy`, `node edit --ssh-proxy` sets or clears it on an existing node, and the Add node tab in the TUI has an SSH-proxy field (prefilled from the source when you clone). `frpctl node list` shows it in the `SSH via` column.
 
 Only SOCKS schemes are accepted — `socks4`, `socks4a`, `socks5`, `socks5h` — because PySocks tunnels the whole SSH connection over them; `socks5h`/`socks4a` resolve the node's hostname on the proxy side, which is what a name only the proxy can resolve needs. It is **mutually exclusive with `proxy_jump`**: a host reaches its SSH either through a SOCKS proxy or through a jump host, not both. The SOCKS socket is handed to Paramiko exactly like a jump-host channel, so key, password and sudo handling are unchanged.
+
+On the client, the same value drives the tunnel unit's `ProxyCommand`, which uses OpenBSD `nc -X 5 -x host:port %h %p` (`-X 4` for `socks4`/`socks4a`) — so `netcat-openbsd` must be installed there. With no proxy set the unit carries `ProxyCommand=none`, dialing the node directly. Either way the tunnel runs with `ServerAliveInterval=15`/`ServerAliveCountMax=3`, so a silently dropped link is torn down and `Restart=always` reconnects it rather than leaving `frpc` writing into a dead forward. Changing a node's SSH proxy therefore needs a `frpctl sync` to regenerate the client's `frp-tunnel@` unit: `sync` rewrites `/etc/frp/tunnels/<node>.env` and the shared `frp-tunnel@.service`, restarts the tunnel, and only then restarts `frpc`. The tunnel dials the node with the restricted forwarding key already installed by `node add`, so this half runs client-side and needs no node password.
+
+The `PROXY_OPT` line the env file carries is what the shared unit's `-o ${PROXY_OPT}` resolves to; a unit whose env predates this line would expand it to an empty `-o` and fail to start. When upgrading a deployment provisioned by an older `frpctl`, run `frpctl sync --all` once so every node's tunnel env gains `PROXY_OPT` before the new unit template takes effect on the next tunnel restart.
 
 ## Per-node Domains and Automatic HTTPS
 
